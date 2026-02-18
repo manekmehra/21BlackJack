@@ -65,7 +65,7 @@ function PlayerSeat({ player, isMe, isActive, position, isHost, onKick, activeHa
     isHost: boolean;
     onKick: (id: string) => void;
     activeHandIdx: number;
-    activeHandIdx: number;
+   
     stack: number;
     onMakeDealer: (id: string) => void;
 }) {
