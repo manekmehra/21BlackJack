@@ -1,0 +1,121 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0a0a;
+  --foreground: #f5f5f7;
+  --glass-surface: rgba(255, 255, 255, 0.06);
+  --glass-border: rgba(255, 255, 255, 0.08);
+  --gold: #d4af37;
+  --gold-light: #f0d060;
+  --crimson: #c41e3a;
+  --crimson-light: #e23050;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-dark: #0a0a0a;
+  --color-apple-grey: #1c1c1e;
+  --color-apple-blue: #0a84ff;
+  --color-apple-green: #30d158;
+  --color-apple-red: #ff453a;
+  --color-gold: #d4af37;
+  --color-crimson: #c41e3a;
+  --color-felt: #0a5c36;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Display", "SF Pro Text", "Segoe UI",
+    Roboto, Helvetica, Arial, sans-serif;
+
+  --radius-xl: 1.5rem;
+  --radius-2xl: 2rem;
+  --radius-3xl: 2.5rem;
+
+  --backdrop-blur-glass: 24px;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* ─── Glass Panel ─────────────────────── */
+.glass-panel {
+  background: var(--glass-surface);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid var(--glass-border);
+}
+
+/* ─── Card Back Pattern ───────────────── */
+.card-pattern {
+  background-image: radial-gradient(var(--gold) 12%, transparent 13%),
+    radial-gradient(var(--gold) 12%, transparent 13%);
+  background-size: 8px 8px;
+  background-position: 0 0, 4px 4px;
+  background-color: #1a1a1a;
+}
+
+/* ─── Premium Card Styling ────────────── */
+.playing-card {
+  font-family: "Georgia", "Times New Roman", serif;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4), 0 1px 4px rgba(0, 0, 0, 0.3),
+    inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+.playing-card-back {
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5), 0 1px 4px rgba(0, 0, 0, 0.3),
+    inset 0 0 30px rgba(212, 175, 55, 0.15);
+}
+
+/* ─── Table Border Glow ───────────────── */
+.table-border-glow {
+  box-shadow:
+    0 20px 60px rgba(0, 0, 0, 0.6),
+    inset 0 0 80px rgba(0, 0, 0, 0.4),
+    0 0 0 3px rgba(212, 175, 55, 0.3),
+    0 0 0 6px rgba(196, 30, 58, 0.15);
+}
+
+/* ─── Score Chip ──────────────────────── */
+.score-chip {
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+}
+
+/* ─── Action Button Glass ─────────────── */
+.action-btn {
+  transition: all 0.2s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.action-btn:hover {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  transform: translateY(-1px);
+}
+
+.action-btn:active {
+  transform: translateY(1px);
+}
+
+/* ─── Premium Scrollbar ───────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
