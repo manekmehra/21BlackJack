@@ -56,8 +56,6 @@ export interface GameSettings {
 }
 
 // ─── Convenience helpers for backwards compat ───────────
-// Many UI components reference player.hand, player.score etc.
-// We provide getters that return the "active" hand data.
 export function getActiveHand(player: Player): PlayerHand | null {
     return player.hands[player.activeHandIndex] ?? player.hands[0] ?? null;
 }
@@ -81,29 +79,32 @@ export function getPlayerCards(player: Player): Card[] {
     return h?.cards ?? [];
 }
 
-// ─── GameState Interface ────────────────────────────────
-interface GameState {
+// ─── Shared State (what gets synced across tabs) ────────
+interface SharedState {
     players: Player[];
     dealerHand: Card[];
     dealerScore: number;
     gamePhase: GamePhase;
     currentTurn: string | null;
-    myPlayerId: string | null;
-    tableCode: string | null;
     deck: Card[];
     message: string | null;
-
     hostId: string | null;
     isTableLocked: boolean;
     ledger: Record<string, LedgerEntry>;
     settings: GameSettings;
     handsPlayed: number;
     dealerId: string | null;
+    tableCode: string | null;
+}
+
+// ─── GameState Interface ────────────────────────────────
+interface GameState extends SharedState {
+    myPlayerId: string | null;
     sessionId: string | null;
 
     // Actions
-    createTable: (nickname: string, buyIn: number, settings?: Partial<GameSettings>) => void;
-    joinTable: (code: string, nickname: string, buyIn: number) => void;
+    createTable: (nickname: string, buyIn: number, settings?: Partial<GameSettings>) => Promise<void>;
+    joinTable: (code: string, nickname: string, buyIn: number) => Promise<void>;
     startRound: () => void;
     hit: () => void;
     stand: () => void;
@@ -138,7 +139,6 @@ function createDeck(): Card[] {
             deck.push({ suit, rank });
         }
     }
-    // Shuffle
     for (let i = deck.length - 1; i > 0; i--) {
         const j = Math.floor(Math.random() * (i + 1));
         [deck[i], deck[j]] = [deck[j], deck[i]];
@@ -164,7 +164,7 @@ function handScore(cards: Card[]): number {
 
 function canSplitHand(hand: PlayerHand): boolean {
     if (hand.cards.length !== 2) return false;
-    if (hand.isSplit) return false; // Already a split hand — no re-split for simplicity
+    if (hand.isSplit) return false;
     return cardValue(hand.cards[0]) === cardValue(hand.cards[1]);
 }
 
@@ -173,7 +173,6 @@ function canDoubleDown(hand: PlayerHand): boolean {
 }
 
 function canSurrender(player: Player): boolean {
-    // Can only surrender on original hand (no splits), with exactly 2 cards
     if (player.hands.length > 1) return false;
     const h = player.hands[0];
     if (!h) return false;
@@ -204,12 +203,10 @@ function createEmptyHand(bet: number): PlayerHand {
     };
 }
 
-// Move to next player/hand. Returns { playerId, handIndex } or null if all done.
 function findNextTurn(players: Player[], currentPlayerId: string, currentHandIndex: number): { playerId: string; handIndex: number } | null {
     const currentPlayerIdx = players.findIndex(p => p.id === currentPlayerId);
     if (currentPlayerIdx < 0) return null;
 
-    // First: check if current player has more hands to play
     const currentPlayer = players[currentPlayerIdx];
     for (let h = currentHandIndex + 1; h < currentPlayer.hands.length; h++) {
         if (currentPlayer.hands[h].status === "playing") {
@@ -217,7 +214,6 @@ function findNextTurn(players: Player[], currentPlayerId: string, currentHandInd
         }
     }
 
-    // Then: check subsequent players
     for (let p = currentPlayerIdx + 1; p < players.length; p++) {
         const player = players[p];
         if (player.isSittingOut) continue;
@@ -228,7 +224,172 @@ function findNextTurn(players: Player[], currentPlayerId: string, currentHandInd
         }
     }
 
-    return null; // All done → dealer's turn
+    return null;
+}
+
+// ─── Cross-Tab Sync via BroadcastChannel + Supabase ──────
+// The "host" is the source of truth — all mutations happen locally,
+// then get broadcast and periodically saved to Supabase.
+
+const LS_PREFIX = "bj_table_";
+let _channel: BroadcastChannel | null = null;
+
+function getTableStorageKey(code: string): string {
+    return `${LS_PREFIX}${code}`;
+}
+
+function getSharedState(state: GameState): SharedState {
+    return {
+        players: state.players,
+        dealerHand: state.dealerHand,
+        dealerScore: state.dealerScore,
+        gamePhase: state.gamePhase,
+        currentTurn: state.currentTurn,
+        deck: state.deck,
+        message: state.message,
+        hostId: state.hostId,
+        isTableLocked: state.isTableLocked,
+        ledger: state.ledger,
+        settings: state.settings,
+        handsPlayed: state.handsPlayed,
+        dealerId: state.dealerId,
+        tableCode: state.tableCode,
+    };
+}
+
+async function saveTableState(state: GameState) {
+    if (!state.tableCode) return;
+    const shared = getSharedState(state);
+
+    // 1. LocalStorage fallback
+    try {
+        localStorage.setItem(getTableStorageKey(state.tableCode), JSON.stringify(shared));
+    } catch { /* ignore */ }
+
+    // 2. Supabase persistence
+    if (supabase) {
+        try {
+            await supabase
+                .from('game_sessions')
+                .upsert({
+                    code: state.tableCode,
+                    state: shared,
+                    host_id: state.hostId,
+                    updated_at: new Date().toISOString(),
+                }, { onConflict: 'code' });
+        } catch (error) {
+            console.error("Supabase Save Error:", error);
+        }
+    }
+}
+
+async function loadTableState(code: string): Promise<SharedState | null> {
+    // 1. Try Supabase first
+    if (supabase) {
+        try {
+            const { data, error } = await supabase
+                .from('game_sessions')
+                .select('state')
+                .eq('code', code)
+                .single();
+
+            if (data && !error) {
+                return data.state as SharedState;
+            }
+        } catch (error) {
+            console.error("Supabase Load Error:", error);
+        }
+    }
+
+    // 2. Fallback to LocalStorage
+    try {
+        const raw = localStorage.getItem(getTableStorageKey(code));
+        if (raw) return JSON.parse(raw) as SharedState;
+    } catch { /* ignore */ }
+
+    return null;
+}
+
+function broadcastUpdate(state: GameState) {
+    saveTableState(state);
+    if (_channel) {
+        _channel.postMessage({ type: "state_sync", payload: getSharedState(state) });
+    }
+}
+
+function setupChannel(
+    code: string,
+    set: (partial: Partial<GameState> | ((state: GameState) => Partial<GameState>)) => void,
+    get: () => GameState
+) {
+    if (_channel) {
+        _channel.close();
+        _channel = null;
+    }
+
+    _channel = new BroadcastChannel(`bj_channel_${code}`);
+
+    _channel.onmessage = (event) => {
+        const { type, payload } = event.data;
+
+        if (type === "state_sync") {
+            const incoming = payload as SharedState;
+            set({
+                players: incoming.players,
+                dealerHand: incoming.dealerHand,
+                dealerScore: incoming.dealerScore,
+                gamePhase: incoming.gamePhase,
+                currentTurn: incoming.currentTurn,
+                deck: incoming.deck,
+                message: incoming.message,
+                hostId: incoming.hostId,
+                isTableLocked: incoming.isTableLocked,
+                ledger: incoming.ledger,
+                settings: incoming.settings,
+                handsPlayed: incoming.handsPlayed,
+                dealerId: incoming.dealerId,
+                tableCode: incoming.tableCode,
+            });
+        }
+
+        if (type === "player_join") {
+            const state = get();
+            if (state.myPlayerId !== state.hostId) return;
+
+            const { player, ledgerEntry } = payload as { player: Player; ledgerEntry: LedgerEntry };
+            if (state.players.find(p => p.id === player.id)) return;
+
+            set((s) => ({
+                players: [...s.players, player],
+                gamePhase: s.gamePhase === "idle" ? "betting" : s.gamePhase,
+                message: `${player.nickname} joined!`,
+                ledger: { ...s.ledger, [player.id]: ledgerEntry },
+            }));
+
+            setTimeout(() => broadcastUpdate(get()), 50);
+        }
+
+        if (type === "player_leave") {
+            const state = get();
+            if (state.myPlayerId !== state.hostId) return;
+            const { playerId } = payload as { playerId: string };
+            set((s) => ({
+                players: s.players.filter(p => p.id !== playerId),
+            }));
+            setTimeout(() => broadcastUpdate(get()), 50);
+        }
+
+        if (type === "request_state") {
+            const state = get();
+            if (state.myPlayerId === state.hostId) {
+                broadcastUpdate(state);
+            }
+        }
+    };
+}
+
+function syncAfterUpdate(get: () => GameState) {
+    broadcastUpdate(get());
 }
 
 // ─── Store ──────────────────────────────────────────────
@@ -298,31 +459,20 @@ export const useGameStore = create<GameState>((set, get) => ({
             dealerId: customSettings?.dealerMode === "me" ? playerId : "system",
         });
 
-        // Supabase Integration: Create Session
-        try {
-            const { data, error } = await supabase
-                .from("game_sessions")
-                .insert({
-                    table_code: code,
-                    host_nickname: nickname,
-                    initial_buy_in: stack,
-                    dealer_mode: customSettings?.dealerMode || "me",
-                    rotation_rule: customSettings?.rotationRule || "permanent",
-                })
-                .select()
-                .single();
-
-            if (data && !error) {
-                set({ sessionId: data.id });
-            }
-        } catch (err) {
-            console.error("Supabase Error:", err);
-        }
+        // Initialize channel and persist to Supabase
+        setupChannel(code, set, get);
+        await saveTableState(get());
+        syncAfterUpdate(get);
     },
 
-    joinTable: (code, nickname, buyIn) => {
-        const { isTableLocked } = get();
-        if (isTableLocked) {
+    joinTable: async (code, nickname, buyIn) => {
+        const existingState = await loadTableState(code);
+        if (!existingState) {
+            alert("Table not found. Please check the code and try again.");
+            return;
+        }
+
+        if (existingState.isTableLocked) {
             alert("Table is locked.");
             return;
         }
@@ -348,14 +498,21 @@ export const useGameStore = create<GameState>((set, get) => ({
             currentStack: stack,
         };
 
-        set((state) => ({
-            players: [...state.players, player],
+        set({
+            ...existingState,
+            message: `Joining table ${code}...`,
             myPlayerId: playerId,
-            tableCode: code,
-            gamePhase: state.gamePhase === "idle" ? "betting" : state.gamePhase,
-            message: `${nickname} joined!`,
-            ledger: { ...state.ledger, [playerId]: ledgerEntry },
-        }));
+        });
+
+        setupChannel(code, set, get);
+
+        if (_channel) {
+            _channel.postMessage({
+                type: "player_join",
+                payload: { player, ledgerEntry },
+            });
+            _channel.postMessage({ type: "request_state", payload: {} });
+        }
     },
 
     toggleSitOut: () => {
@@ -367,11 +524,22 @@ export const useGameStore = create<GameState>((set, get) => ({
             ),
             message: "Player status updated.",
         });
+        syncAfterUpdate(get);
     },
 
     leaveTable: () => {
         const { myPlayerId } = get();
         if (!myPlayerId) return;
+
+        if (_channel) {
+            _channel.postMessage({
+                type: "player_leave",
+                payload: { playerId: myPlayerId },
+            });
+            _channel.close();
+            _channel = null;
+        }
+
         set(state => ({
             players: state.players.filter(p => p.id !== myPlayerId),
             myPlayerId: null,
@@ -390,6 +558,7 @@ export const useGameStore = create<GameState>((set, get) => ({
                 p.id === myPlayerId ? { ...p, currentBet: clamped } : p
             ),
         });
+        syncAfterUpdate(get);
     },
 
     rebuy: (amount) => {
@@ -406,6 +575,7 @@ export const useGameStore = create<GameState>((set, get) => ({
             ledger: { ...state.ledger, [myPlayerId]: updatedEntry },
             message: "Rebuy successful!",
         }));
+        syncAfterUpdate(get);
     },
 
     kickPlayer: (playerId) => {
@@ -415,16 +585,19 @@ export const useGameStore = create<GameState>((set, get) => ({
             players: state.players.filter(p => p.id !== playerId),
             message: "Player kicked.",
         }));
+        syncAfterUpdate(get);
     },
 
     toggleLock: () => {
         const { hostId, myPlayerId } = get();
         if (myPlayerId !== hostId) return;
         set(state => ({ isTableLocked: !state.isTableLocked }));
+        syncAfterUpdate(get);
     },
 
     updateSettings: (newSettings) => {
         set(state => ({ settings: { ...state.settings, ...newSettings } }));
+        syncAfterUpdate(get);
     },
 
     // ── Round Flow ────────────────────────────────────────
@@ -432,7 +605,6 @@ export const useGameStore = create<GameState>((set, get) => ({
         const deck = createDeck();
         const { players, handsPlayed, settings, dealerId } = get();
 
-        // Dealer rotation
         let newDealerId = dealerId;
         if (settings.rotationRule === "rotate" && handsPlayed > 0 && handsPlayed % settings.rotationInterval === 0) {
             const currentIdx = players.findIndex(p => p.id === dealerId);
@@ -440,7 +612,6 @@ export const useGameStore = create<GameState>((set, get) => ({
             newDealerId = players[nextIdx]?.id || "system";
         }
 
-        // Deal to players
         const updatedPlayers = players.map((p) => {
             if (p.isSittingOut) {
                 return { ...p, hands: [], activeHandIndex: 0, insuranceBet: 0, hasRespondedInsurance: true };
@@ -453,15 +624,11 @@ export const useGameStore = create<GameState>((set, get) => ({
             const ledgerEntry = get().ledger[p.id];
             const currentStack = ledgerEntry?.currentStack ?? 0;
 
-            // Critical Fix: Clamp bet to actual stack size
-            // If they have 0, they can't play (should sit out, but here we just give 0 bet or force sit out?)
-            // Let's clamp to stack. If stack is 0, bet is 0.
             let effectiveBet = p.currentBet || DEFAULT_BET;
             if (effectiveBet > currentStack) {
                 effectiveBet = currentStack;
             }
 
-            // If stack is 0 or less, force sit out for this round
             if (effectiveBet <= 0) {
                 return { ...p, hands: [], activeHandIndex: 0, insuranceBet: 0, hasRespondedInsurance: true, isSittingOut: true };
             }
@@ -485,16 +652,13 @@ export const useGameStore = create<GameState>((set, get) => ({
             };
         });
 
-        // Dealer cards
         const dealerCard1 = deck.pop()!;
         const dealerCard2 = { ...deck.pop()!, faceDown: true };
         const dealerHand = [dealerCard1, dealerCard2];
 
-        // Check if dealer up-card is Ace → insurance phase
         const dealerShowsAce = dealerCard1.rank === "A";
 
         if (dealerShowsAce) {
-            // Mark sitting-out players as already responded
             set({
                 players: updatedPlayers,
                 dealerHand,
@@ -505,10 +669,10 @@ export const useGameStore = create<GameState>((set, get) => ({
                 message: "Dealer shows Ace — Insurance?",
                 dealerId: newDealerId,
             });
+            syncAfterUpdate(get);
             return;
         }
 
-        // Normal play
         const firstPlayer = updatedPlayers.find(p => !p.isSittingOut && p.hands.length > 0 && p.hands[0].status === "playing");
 
         set({
@@ -521,8 +685,8 @@ export const useGameStore = create<GameState>((set, get) => ({
             message: "Cards dealt!",
             dealerId: newDealerId,
         });
+        syncAfterUpdate(get);
 
-        // If all players have blackjack, go to dealer
         if (!firstPlayer) {
             get().dealerPlay();
         }
@@ -540,8 +704,8 @@ export const useGameStore = create<GameState>((set, get) => ({
         });
 
         set({ players: updatedPlayers, message: "Insurance taken." });
+        syncAfterUpdate(get);
 
-        // Check if all active players have responded
         const allResponded = updatedPlayers.every(p => p.isSittingOut || p.hasRespondedInsurance || p.hands.length === 0);
         if (allResponded) {
             resolveInsurance(set, get);
@@ -558,6 +722,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         });
 
         set({ players: updatedPlayers, message: "Insurance declined." });
+        syncAfterUpdate(get);
 
         const allResponded = updatedPlayers.every(p => p.isSittingOut || p.hasRespondedInsurance || p.hands.length === 0);
         if (allResponded) {
@@ -580,12 +745,13 @@ export const useGameStore = create<GameState>((set, get) => ({
         const newCards = [...hand.cards, newCard];
         const score = handScore(newCards);
         const busted = score > 21;
+        const got21 = score === 21;
 
         const updatedHand: PlayerHand = {
             ...hand,
             cards: newCards,
             score,
-            status: busted ? "busted" : "playing",
+            status: busted ? "busted" : got21 ? "stood" : "playing",
         };
 
         const updatedPlayers = players.map(p => {
@@ -599,12 +765,13 @@ export const useGameStore = create<GameState>((set, get) => ({
         let phase: GamePhase = "playing";
         let message: string | null = null;
 
-        if (busted) {
-            message = `${player.nickname} busted!`;
+        if (busted || got21) {
+            message = busted
+                ? `${player.nickname} busted!`
+                : `${player.nickname} hits 21!`;
             const next = findNextTurn(updatedPlayers, currentTurn, handIdx);
             if (next) {
                 nextTurn = next.playerId;
-                // Update activeHandIndex on the next player
                 const np = updatedPlayers.find(p => p.id === next.playerId);
                 if (np) np.activeHandIndex = next.handIndex;
             } else {
@@ -614,6 +781,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         }
 
         set({ players: updatedPlayers, deck, currentTurn: nextTurn, gamePhase: phase, message });
+        syncAfterUpdate(get);
 
         if (phase === "dealer-turn") {
             get().dealerPlay();
@@ -639,7 +807,6 @@ export const useGameStore = create<GameState>((set, get) => ({
         const next = findNextTurn(updatedPlayers, currentTurn, handIdx);
 
         if (next) {
-            // Update activeHandIndex
             const np = updatedPlayers.find(p => p.id === next.playerId);
             if (np) np.activeHandIndex = next.handIndex;
 
@@ -655,8 +822,11 @@ export const useGameStore = create<GameState>((set, get) => ({
                 gamePhase: "dealer-turn",
                 message: "Dealer's turn...",
             });
+            syncAfterUpdate(get);
             get().dealerPlay();
+            return;
         }
+        syncAfterUpdate(get);
     },
 
     // ── Split ─────────────────────────────────────────────
@@ -667,7 +837,6 @@ export const useGameStore = create<GameState>((set, get) => ({
         const player = players.find(p => p.id === currentTurn);
         if (!player) return;
 
-        // Betting Limit Check: Need equal amount for split
         const handIdx = player.activeHandIndex;
         const hand = player.hands[handIdx];
         if (!hand || !canSplitHand(hand)) return;
@@ -682,7 +851,6 @@ export const useGameStore = create<GameState>((set, get) => ({
 
         const isAces = hand.cards[0].rank === "A";
 
-        // Create two new hands from the split cards
         const card1ForHand1 = deck.pop()!;
         const card2ForHand2 = deck.pop()!;
 
@@ -692,7 +860,6 @@ export const useGameStore = create<GameState>((set, get) => ({
         const hand1Score = handScore(hand1Cards);
         const hand2Score = handScore(hand2Cards);
 
-        // If split aces: one card only, auto-stand both
         const hand1: PlayerHand = {
             cards: hand1Cards,
             score: hand1Score,
@@ -706,7 +873,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         const hand2: PlayerHand = {
             cards: hand2Cards,
             score: hand2Score,
-            bet: hand.bet, // Same bet as original
+            bet: hand.bet,
             status: isAces ? "stood" : (hand2Score === 21 ? "blackjack" : "playing"),
             isDoubledDown: false,
             isSplit: true,
@@ -716,13 +883,12 @@ export const useGameStore = create<GameState>((set, get) => ({
         const updatedPlayers = players.map(p => {
             if (p.id !== currentTurn) return p;
             const newHands = [...p.hands];
-            newHands.splice(handIdx, 1, hand1, hand2); // Replace original with two
+            newHands.splice(handIdx, 1, hand1, hand2);
             return { ...p, hands: newHands, activeHandIndex: handIdx };
         });
 
         if (isAces) {
-            // Both hands auto-stood, move to next
-            const next = findNextTurn(updatedPlayers, currentTurn, handIdx + 1); // Skip both split hands
+            const next = findNextTurn(updatedPlayers, currentTurn, handIdx + 1);
             if (next) {
                 const np = updatedPlayers.find(p => p.id === next.playerId);
                 if (np) np.activeHandIndex = next.handIndex;
@@ -740,16 +906,18 @@ export const useGameStore = create<GameState>((set, get) => ({
                     gamePhase: "dealer-turn",
                     message: "Dealer's turn...",
                 });
+                syncAfterUpdate(get);
                 get().dealerPlay();
+                return;
             }
         } else {
-            // Play hand1 first
             set({
                 players: updatedPlayers,
                 deck,
                 message: `${player.nickname} splits!`,
             });
         }
+        syncAfterUpdate(get);
     },
 
     // ── Double Down ───────────────────────────────────────
@@ -763,7 +931,6 @@ export const useGameStore = create<GameState>((set, get) => ({
         const hand = player.hands[handIdx];
         if (!hand || !canDoubleDown(hand)) return;
 
-        // Betting Limit Check: Need equal amount for double
         const doubleCost = hand.bet;
         const playerStack = ledger[player.id]?.currentStack ?? 0;
 
@@ -781,8 +948,8 @@ export const useGameStore = create<GameState>((set, get) => ({
             ...hand,
             cards: newCards,
             score,
-            bet: hand.bet * 2, // Double the bet
-            status: busted ? "busted" : "stood", // Auto-stand after one card
+            bet: hand.bet * 2,
+            status: busted ? "busted" : "stood",
             isDoubledDown: true,
         };
 
@@ -805,8 +972,11 @@ export const useGameStore = create<GameState>((set, get) => ({
             set({ players: updatedPlayers, deck, currentTurn: next.playerId, message: msg });
         } else {
             set({ players: updatedPlayers, deck, currentTurn: null, gamePhase: "dealer-turn", message: "Dealer's turn..." });
+            syncAfterUpdate(get);
             get().dealerPlay();
+            return;
         }
+        syncAfterUpdate(get);
     },
 
     // ── Surrender ─────────────────────────────────────────
@@ -821,7 +991,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         const updatedHand: PlayerHand = {
             ...hand,
             status: "surrendered",
-            bet: Math.floor(hand.bet / 2), // Lose half
+            bet: Math.floor(hand.bet / 2),
             isSurrendered: true,
         };
 
@@ -838,8 +1008,11 @@ export const useGameStore = create<GameState>((set, get) => ({
             set({ players: updatedPlayers, currentTurn: next.playerId, message: `${player.nickname} surrenders.` });
         } else {
             set({ players: updatedPlayers, currentTurn: null, gamePhase: "dealer-turn", message: "Dealer's turn..." });
+            syncAfterUpdate(get);
             get().dealerPlay();
+            return;
         }
+        syncAfterUpdate(get);
     },
 
     // ── Dealer Play ───────────────────────────────────────
@@ -852,6 +1025,7 @@ export const useGameStore = create<GameState>((set, get) => ({
         let score = handScore(hand);
 
         set({ dealerHand: hand, dealerScore: score, message: `Dealer shows ${score}.` });
+        syncAfterUpdate(get);
         await delay(1000);
 
         while (score < 17 && deck.length > 0) {
@@ -860,10 +1034,11 @@ export const useGameStore = create<GameState>((set, get) => ({
             hand = [...hand, newCard];
             score = handScore(hand);
             set({ dealerHand: hand, dealerScore: score, deck });
+            syncAfterUpdate(get);
             await delay(1000);
         }
 
-        // Settlement — iterate every hand of every player
+        // Settlement
         const { players, ledger } = get();
         const dealerBJ = score === 21 && hand.length === 2;
         const newLedger = { ...ledger };
@@ -896,12 +1071,11 @@ export const useGameStore = create<GameState>((set, get) => ({
                 return { ...h, status };
             });
 
-            // Calculate ledger changes for this player
             let totalChange = 0;
             settledHands.forEach(h => {
                 if (h.status === "waiting") return;
                 if (h.isSurrendered) {
-                    totalChange -= h.bet; // Already halved during surrender action
+                    totalChange -= h.bet;
                 } else if (h.status === "won") {
                     totalChange += h.bet;
                 } else if (h.status === "blackjack") {
@@ -909,15 +1083,13 @@ export const useGameStore = create<GameState>((set, get) => ({
                 } else if (h.status === "busted" || h.status === "lost") {
                     totalChange -= h.bet;
                 }
-                // Push = 0 change
             });
 
-            // Insurance payout
             if (p.insuranceBet > 0) {
                 if (dealerBJ) {
-                    totalChange += p.insuranceBet * 2; // Pays 2:1
+                    totalChange += p.insuranceBet * 2;
                 } else {
-                    totalChange -= p.insuranceBet; // Loses insurance bet
+                    totalChange -= p.insuranceBet;
                 }
             }
 
@@ -946,59 +1118,7 @@ export const useGameStore = create<GameState>((set, get) => ({
             message: resultMsg,
             handsPlayed: state.handsPlayed + 1,
         }));
-
-        // Supabase Integration: Log Hand & Results
-        const { sessionId, handsPlayed } = get();
-        if (sessionId) {
-            try {
-                // 1. Create Hand Record
-                const { data: handData, error: handError } = await supabase
-                    .from("hands")
-                    .insert({
-                        session_id: sessionId,
-                        hand_number: handsPlayed,
-                        dealer_score: score,
-                        dealer_cards: hand,
-                        result_message: resultMsg,
-                    })
-                    .select()
-                    .single();
-
-                if (handData && !handError) {
-                    const handId = handData.id;
-
-                    // 2. Create Player Result Records
-                    const resultsPayload = settledPlayers
-                        .filter(p => !p.isSittingOut && p.hands.length > 0 && p.hands[0].status !== "waiting")
-                        .flatMap(p => {
-                            // Calculate net profit for this round only
-                            const previousStack = ledger[p.id]?.currentStack ?? p.hands.reduce((s, h) => s + h.bet, 0); // approx
-                            const currentStack = newLedger[p.id]?.currentStack ?? previousStack;
-                            const roundProfit = currentStack - (ledger[p.id]?.currentStack ?? currentStack);
-
-                            // We'll log the first hand for simplicity, or we could log multiple rows if split?
-                            // For simplicity, let's just log the player's summary for the round
-                            return {
-                                hand_id: handId,
-                                session_id: sessionId,
-                                player_nickname: p.nickname,
-                                player_id: p.id,
-                                bet_amount: getPlayerBet(p),
-                                payout_amount: roundProfit,
-                                outcome: getPlayerStatus(p), // e.g. "won", "lost", "split"
-                                cards: p.hands.flatMap(h => h.cards),
-                                final_score: getPlayerScore(p),
-                            };
-                        });
-
-                    if (resultsPayload.length > 0) {
-                        await supabase.from("player_results").insert(resultsPayload);
-                    }
-                }
-            } catch (err) {
-                console.error("Supabase Log Error:", err);
-            }
-        }
+        syncAfterUpdate(get);
     },
 
     // ── Reset ─────────────────────────────────────────────
@@ -1018,26 +1138,26 @@ export const useGameStore = create<GameState>((set, get) => ({
             deck: [],
             message: "Place your bets.",
         }));
+        syncAfterUpdate(get);
     },
 
     setDealerId: (playerId) => {
         set({ dealerId: playerId, message: "Dealer updated." });
+        syncAfterUpdate(get);
     },
 }));
 
-// ── Insurance Resolution (outside store for clarity) ────
+// ── Insurance Resolution ────────────────────────────────
 function resolveInsurance(
     set: (partial: Partial<GameState> | ((state: GameState) => Partial<GameState>)) => void,
     get: () => GameState
 ) {
     const { dealerHand, players } = get();
-    // Reveal dealer's hole card
     const revealed = dealerHand.map(c => ({ ...c, faceDown: false }));
     const dealerScore = handScore(revealed);
     const dealerHasBJ = dealerScore === 21 && revealed.length === 2;
 
     if (dealerHasBJ) {
-        // Dealer has blackjack — insurance pays, round ends immediately
         const { ledger } = get();
         const newLedger = { ...ledger };
 
@@ -1046,17 +1166,12 @@ function resolveInsurance(
 
             let totalChange = 0;
 
-            // Insurance payout: 2:1
             if (p.insuranceBet > 0) {
                 totalChange += p.insuranceBet * 2;
-            } else {
-                // No insurance taken
             }
 
-            // Main hand: player BJ = push, else lose
             const settledHands = p.hands.map(h => {
                 if (h.status === "blackjack") {
-                    // Push — no change
                     return { ...h, status: "push" as PlayerStatus };
                 } else {
                     totalChange -= h.bet;
@@ -1086,8 +1201,8 @@ function resolveInsurance(
             message: "Dealer has Blackjack!",
             handsPlayed: state.handsPlayed + 1,
         }));
+        syncAfterUpdate(get);
     } else {
-        // No dealer BJ — lose insurance bets, continue to play
         const { ledger } = get();
         const newLedger = { ...ledger };
 
@@ -1108,13 +1223,13 @@ function resolveInsurance(
         const firstPlayer = updatedPlayers.find(p => !p.isSittingOut && p.hands.length > 0 && p.hands[0].status === "playing");
 
         set({
-            // Don't reveal hole card yet — keep it face down
             players: updatedPlayers,
             ledger: newLedger,
             gamePhase: "playing",
             currentTurn: firstPlayer?.id || null,
             message: "No Blackjack. Play continues.",
         });
+        syncAfterUpdate(get);
 
         if (!firstPlayer) {
             get().dealerPlay();
