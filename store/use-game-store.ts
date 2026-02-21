@@ -613,8 +613,14 @@ export const useGameStore = create<GameState>((set, get) => ({
             newDealerId = players[nextIdx]?.id || "system";
         }
 
+        const playingPlayers = players.filter(p => !p.isSittingOut && p.id !== newDealerId);
+        if (playingPlayers.length === 0) {
+            set({ message: "Waiting for players to place bets...", dealerId: newDealerId });
+            return;
+        }
+
         const updatedPlayers = players.map((p) => {
-            if (p.isSittingOut) {
+            if (p.isSittingOut || p.id === newDealerId) {
                 return { ...p, hands: [], activeHandIndex: 0, insuranceBet: 0, hasRespondedInsurance: true };
             }
 
@@ -1043,9 +1049,10 @@ export const useGameStore = create<GameState>((set, get) => ({
         const { players, ledger } = get();
         const dealerBJ = score === 21 && hand.length === 2;
         const newLedger = { ...ledger };
+        let dealerProfit = 0;
 
         const settledPlayers = players.map((p) => {
-            if (p.isSittingOut || p.hands.length === 0) return p;
+            if (p.isSittingOut || p.id === get().dealerId || p.hands.length === 0) return p;
 
             const settledHands = p.hands.map((h) => {
                 if (h.status === "waiting") return h;
@@ -1102,9 +1109,21 @@ export const useGameStore = create<GameState>((set, get) => ({
                     netProfit: (entry.currentStack + totalChange) - entry.totalBuyIn,
                 };
             }
+            dealerProfit -= totalChange;
 
             return { ...p, hands: settledHands };
         });
+
+        // Apply dealer profit
+        const curDealerId = get().dealerId;
+        if (curDealerId && curDealerId !== "system" && newLedger[curDealerId]) {
+            const entry = newLedger[curDealerId];
+            newLedger[curDealerId] = {
+                ...entry,
+                currentStack: entry.currentStack + dealerProfit,
+                netProfit: (entry.currentStack + dealerProfit) - entry.totalBuyIn,
+            };
+        }
 
         const resultMsg = score > 21 ? "Dealer busts!" : `Dealer stands at ${score}.`;
 
@@ -1161,9 +1180,10 @@ function resolveInsurance(
     if (dealerHasBJ) {
         const { ledger } = get();
         const newLedger = { ...ledger };
+        let dealerProfit = 0;
 
         const settledPlayers = players.map(p => {
-            if (p.isSittingOut || p.hands.length === 0) return p;
+            if (p.isSittingOut || p.id === get().dealerId || p.hands.length === 0) return p;
 
             let totalChange = 0;
 
@@ -1188,9 +1208,21 @@ function resolveInsurance(
                     netProfit: (entry.currentStack + totalChange) - entry.totalBuyIn,
                 };
             }
+            dealerProfit -= totalChange;
 
             return { ...p, hands: settledHands };
         });
+
+        // Apply dealer profit
+        const curDealerId = get().dealerId;
+        if (curDealerId && curDealerId !== "system" && newLedger[curDealerId]) {
+            const entry = newLedger[curDealerId];
+            newLedger[curDealerId] = {
+                ...entry,
+                currentStack: entry.currentStack + dealerProfit,
+                netProfit: (entry.currentStack + dealerProfit) - entry.totalBuyIn,
+            };
+        }
 
         set(state => ({
             dealerHand: revealed,

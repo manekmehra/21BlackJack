@@ -47,7 +47,7 @@ function HandCards({ hand, handIndex, isActive }: { hand: PlayerHand; handIndex:
         )}>
             <AnimatePresence>
                 {hand.cards.map((card, i) => (
-                    <div key={i} className="relative" style={{ marginLeft: i > 0 ? -12 : 0, zIndex: i }}>
+                    <div key={i} className="relative" style={{ marginLeft: i > 0 ? -24 : 0, zIndex: i }}>
                         <Card rank={card.rank} suit={card.suit} faceDown={card.faceDown} index={i} />
                     </div>
                 ))}
@@ -135,7 +135,7 @@ function PlayerSeat({ player, isMe, isActive, position, isHost, onKick, activeHa
                         animate={{ scale: 1, opacity: 1 }}
                         exit={{ opacity: 0 }}
                         className={clsx(
-                            "absolute top-2 sm:top-4 z-50 px-3 sm:px-5 py-1 sm:py-2 rounded-xl sm:rounded-2xl text-[10px] sm:text-sm font-bold uppercase shadow-xl border tracking-widest backdrop-blur-xl",
+                            "absolute -top-6 sm:-top-8 z-50 px-3 sm:px-5 py-0.5 sm:py-1 rounded-lg sm:rounded-xl text-[9px] sm:text-xs font-bold uppercase shadow-xl border tracking-widest backdrop-blur-xl",
                             label === "WIN!" || label === "BJ!" ? "bg-gradient-to-r from-[#f0d060] to-[#d4af37] text-black border-yellow-300" :
                                 label === "BUST" || label === "LOST" ? "bg-gradient-to-r from-red-500 to-red-600 text-white border-red-400" :
                                     label === "AWAY" ? "bg-gray-700 text-white border-gray-600" :
@@ -473,21 +473,29 @@ export function GameTable() {
                         </div>
                     </div>
 
-                    {/* Player Seats */}
-                    {players.map((player, idx) => (
-                        <PlayerSeat
-                            key={player.id}
-                            player={player}
-                            isMe={player.id === myPlayerId}
-                            isActive={player.id === currentTurn}
-                            position={SEAT_POSITIONS[idx % SEAT_POSITIONS.length]}
-                            isHost={Boolean(isHost)}
-                            onKick={kickPlayer}
-                            activeHandIdx={player.activeHandIndex}
-                            stack={ledger[player.id]?.currentStack ?? 0}
-                            onMakeDealer={setDealerId}
-                        />
-                    ))}
+                    {/* Player Seats - Circularly shifted so local player is always at index 0 (bottom center) */}
+                    {(() => {
+                        const meIndex = players.findIndex(p => p.id === myPlayerId);
+                        let displayPlayers = [...players];
+                        if (meIndex > 0) {
+                            displayPlayers = [...players.slice(meIndex), ...players.slice(0, meIndex)];
+                        }
+
+                        return displayPlayers.map((player, idx) => (
+                            <PlayerSeat
+                                key={player.id}
+                                player={player}
+                                isMe={player.id === myPlayerId}
+                                isActive={player.id === currentTurn}
+                                position={SEAT_POSITIONS[idx % SEAT_POSITIONS.length]}
+                                isHost={Boolean(isHost)}
+                                onKick={kickPlayer}
+                                activeHandIdx={player.activeHandIndex}
+                                stack={ledger[player.id]?.currentStack ?? 0}
+                                onMakeDealer={setDealerId}
+                            />
+                        ));
+                    })()}
                 </div>
             </div>
 
