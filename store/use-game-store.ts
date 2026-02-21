@@ -232,7 +232,7 @@ function findNextTurn(players: Player[], currentPlayerId: string, currentHandInd
 // then get broadcast and periodically saved to Supabase.
 
 const LS_PREFIX = "bj_table_";
-let _channel: BroadcastChannel | null = null;
+let _channel: any = null;
 
 function getTableStorageKey(code: string): string {
     return `${LS_PREFIX}${code}`;
@@ -313,7 +313,11 @@ async function loadTableState(code: string): Promise<SharedState | null> {
 function broadcastUpdate(state: GameState) {
     saveTableState(state);
     if (_channel) {
-        _channel.postMessage({ type: "state_sync", payload: getSharedState(state) });
+        _channel.send({
+            type: "broadcast",
+            event: "state_sync",
+            payload: getSharedState(state),
+        });
     }
 }
 
@@ -323,17 +327,15 @@ function setupChannel(
     get: () => GameState
 ) {
     if (_channel) {
-        _channel.close();
+        supabase.removeChannel(_channel);
         _channel = null;
     }
 
-    _channel = new BroadcastChannel(`bj_channel_${code}`);
+    _channel = supabase.channel(`room_${code}`);
 
-    _channel.onmessage = (event) => {
-        const { type, payload } = event.data;
-
-        if (type === "state_sync") {
-            const incoming = payload as SharedState;
+    _channel
+        .on("broadcast", { event: "state_sync" }, (event: any) => {
+            const incoming = event.payload as SharedState;
             set({
                 players: incoming.players,
                 dealerHand: incoming.dealerHand,
@@ -350,13 +352,12 @@ function setupChannel(
                 dealerId: incoming.dealerId,
                 tableCode: incoming.tableCode,
             });
-        }
-
-        if (type === "player_join") {
+        })
+        .on("broadcast", { event: "player_join" }, (event: any) => {
             const state = get();
             if (state.myPlayerId !== state.hostId) return;
 
-            const { player, ledgerEntry } = payload as { player: Player; ledgerEntry: LedgerEntry };
+            const { player, ledgerEntry } = event.payload as { player: Player; ledgerEntry: LedgerEntry };
             if (state.players.find(p => p.id === player.id)) return;
 
             set((s) => ({
@@ -367,25 +368,23 @@ function setupChannel(
             }));
 
             setTimeout(() => broadcastUpdate(get()), 50);
-        }
-
-        if (type === "player_leave") {
+        })
+        .on("broadcast", { event: "player_leave" }, (event: any) => {
             const state = get();
             if (state.myPlayerId !== state.hostId) return;
-            const { playerId } = payload as { playerId: string };
+            const { playerId } = event.payload as { playerId: string };
             set((s) => ({
                 players: s.players.filter(p => p.id !== playerId),
             }));
             setTimeout(() => broadcastUpdate(get()), 50);
-        }
-
-        if (type === "request_state") {
+        })
+        .on("broadcast", { event: "request_state" }, () => {
             const state = get();
             if (state.myPlayerId === state.hostId) {
                 broadcastUpdate(state);
             }
-        }
-    };
+        })
+        .subscribe();
 }
 
 function syncAfterUpdate(get: () => GameState) {
@@ -507,11 +506,12 @@ export const useGameStore = create<GameState>((set, get) => ({
         setupChannel(code, set, get);
 
         if (_channel) {
-            _channel.postMessage({
-                type: "player_join",
+            _channel.send({
+                type: "broadcast",
+                event: "player_join",
                 payload: { player, ledgerEntry },
             });
-            _channel.postMessage({ type: "request_state", payload: {} });
+            _channel.send({ type: "broadcast", event: "request_state", payload: {} });
         }
     },
 
@@ -532,11 +532,12 @@ export const useGameStore = create<GameState>((set, get) => ({
         if (!myPlayerId) return;
 
         if (_channel) {
-            _channel.postMessage({
-                type: "player_leave",
+            _channel.send({
+                type: "broadcast",
+                event: "player_leave",
                 payload: { playerId: myPlayerId },
             });
-            _channel.close();
+            supabase.removeChannel(_channel);
             _channel = null;
         }
 
